@@ -206,7 +206,6 @@ export async function recordSession(options: RecordOptions): Promise<RecordSessi
         settleTimer = undefined;
         void finalize('eof');
       }, delayMs);
-      settleTimer.unref();
     };
 
     child.on('error', (err) => {

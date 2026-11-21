@@ -1,4 +1,4 @@
-import { spawn, type ChildProcess } from 'node:child_process';
+import { execFile, spawn, type ChildProcess } from 'node:child_process';
 
 export interface SpawnChildOptions {
   env?: NodeJS.ProcessEnv;
@@ -87,8 +87,54 @@ function isPidAlive(pid: number): boolean {
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => {
-    const t = setTimeout(resolve, ms);
-    t.unref();
+    setTimeout(resolve, ms);
+  });
+}
+
+function collectPosixDescendants(rootPid: number): Promise<number[]> {
+  return new Promise((resolve) => {
+    execFile(
+      'ps',
+      ['-eo', 'pid=,ppid='],
+      { shell: false, timeout: 2000 },
+      (err, stdout) => {
+        if (err || !stdout) {
+          resolve([]);
+          return;
+        }
+        const childrenByParent = new Map<number, number[]>();
+        for (const rawLine of stdout.split(/\r?\n/)) {
+          const trimmed = rawLine.trim();
+          if (!trimmed) continue;
+          const parts = trimmed.split(/\s+/);
+          if (parts.length < 2) continue;
+          const pid = Number.parseInt(parts[0]!, 10);
+          const ppid = Number.parseInt(parts[1]!, 10);
+          if (!Number.isInteger(pid) || pid <= 0 || !Number.isInteger(ppid) || ppid < 0) {
+            continue;
+          }
+          const list = childrenByParent.get(ppid) ?? [];
+          list.push(pid);
+          childrenByParent.set(ppid, list);
+        }
+
+        const descendants: number[] = [];
+        const visited = new Set<number>([rootPid]);
+        const queue: number[] = [rootPid];
+        while (queue.length > 0) {
+          const current = queue.shift()!;
+          const kids = childrenByParent.get(current) ?? [];
+          for (const kid of kids) {
+            if (!visited.has(kid)) {
+              visited.add(kid);
+              descendants.push(kid);
+              queue.push(kid);
+            }
+          }
+        }
+        resolve(descendants);
+      },
+    );
   });
 }
 
@@ -136,7 +182,9 @@ export async function killProcessTree(child: ChildProcess): Promise<void> {
     return;
   }
 
-  // POSIX: child was spawned with `detached: true`, so `-pid` addresses the entire process group.
+  // POSIX: collect descendant PIDs BEFORE killing parent (captures `detached: true` grandchildren too).
+  const descendants = await collectPosixDescendants(pid);
+
   try {
     process.kill(-pid, 'SIGTERM');
   } catch {
@@ -146,9 +194,18 @@ export async function killProcessTree(child: ChildProcess): Promise<void> {
       // already dead
     }
   }
+  for (const descPid of descendants) {
+    try {
+      process.kill(descPid, 'SIGTERM');
+    } catch {
+      // already dead
+    }
+  }
 
   for (let attempt = 0; attempt < 10; attempt += 1) {
-    if (!isPidAlive(pid)) {
+    const childRunning = child.exitCode === null && child.signalCode === null && isPidAlive(pid);
+    const anyDescAlive = descendants.some((dPid) => isPidAlive(dPid));
+    if (!childRunning && !anyDescAlive) {
       break;
     }
     await delay(25);
@@ -158,11 +215,20 @@ export async function killProcessTree(child: ChildProcess): Promise<void> {
     process.kill(-pid, 'SIGKILL');
   } catch {
     try {
-      if (isPidAlive(pid)) {
+      if (child.exitCode === null && child.signalCode === null && isPidAlive(pid)) {
         child.kill('SIGKILL');
       }
     } catch {
       // ignore
+    }
+  }
+  for (const descPid of descendants) {
+    if (isPidAlive(descPid)) {
+      try {
+        process.kill(descPid, 'SIGKILL');
+      } catch {
+        // ignore
+      }
     }
   }
 
