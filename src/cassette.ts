@@ -246,13 +246,39 @@ export function loadCassette(filePath: string): { cassette: CassetteV1; byteSize
   return { cassette, byteSize: stats.size };
 }
 
+let atomicTempSeq = 0;
+
 /**
- * Saves a CassetteV1 to disk in deterministic sorted-key JSON format.
+ * Saves a CassetteV1 atomically to disk in deterministic sorted-key JSON format.
  */
 export function saveCassette(filePath: string, cassette: CassetteV1): string {
   const resolved = path.resolve(filePath);
   const serialized = serializeCassette(cassette);
   fs.mkdirSync(path.dirname(resolved), { recursive: true });
-  fs.writeFileSync(resolved, serialized, 'utf8');
+
+  atomicTempSeq += 1;
+  const tmpPath = `${resolved}.${process.pid}.${Date.now()}-${atomicTempSeq}.tmp`;
+  try {
+    fs.writeFileSync(tmpPath, serialized, 'utf8');
+    try {
+      fs.renameSync(tmpPath, resolved);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException | undefined)?.code;
+      if (code === 'EPERM' || code === 'EACCES') {
+        fs.writeFileSync(resolved, serialized, 'utf8');
+      } else {
+        throw err;
+      }
+    }
+  } finally {
+    try {
+      if (fs.existsSync(tmpPath)) {
+        fs.unlinkSync(tmpPath);
+      }
+    } catch {
+      // ignore cleanup errors
+    }
+  }
+
   return serialized;
 }

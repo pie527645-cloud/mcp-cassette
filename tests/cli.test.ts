@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { describe, it } from 'node:test';
 import { fileURLToPath } from 'node:url';
+import { loadCassette } from '../src/cassette.js';
+import { attachLineReader } from '../src/line-reader.js';
 
 const CURRENT_DIR = path.dirname(fileURLToPath(import.meta.url));
 // Compiled CLI lives at `<repo>/dist/cli.js`; compiled mock fixture lives at `<repo>/dist-test/tests/fixtures/mock-mcp-server.js`
@@ -215,6 +217,141 @@ describe('CLI entrypoint, symlink execution, and cross-platform child + grandchi
       assert.equal(replayRes.code, 0);
       const replayObj = JSON.parse(replayRes.stdout.trim()) as Record<string, unknown>;
       assert.equal(replayObj.id, 1);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('flushes cassette atomically before forwarding stdout response when host immediately hard-kills record', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcp-cassette-hardkill-'));
+    try {
+      const cassettePath = path.join(tmpDir, 'hardkill.mcp-cassette.json');
+
+      const recordProc = spawn(
+        process.execPath,
+        [
+          DIST_CLI,
+          'record',
+          '--stdio',
+          `"${process.execPath}" "${MOCK_SERVER_SCRIPT}"`,
+          '--out',
+          cassettePath,
+        ],
+        {
+          shell: false,
+          stdio: ['pipe', 'pipe', 'pipe'],
+          windowsHide: true,
+          detached: process.platform !== 'win32',
+        },
+      );
+
+      const sequenceMessages = [
+        {
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'initialize',
+          params: {
+            protocolVersion: '2024-11-05',
+            capabilities: {},
+            clientInfo: { name: 'mcp-doctor-like-host', version: '1.0.0' },
+          },
+        },
+        {
+          jsonrpc: '2.0',
+          method: 'notifications/initialized',
+        },
+        {
+          jsonrpc: '2.0',
+          id: 2,
+          method: 'tools/list',
+        },
+      ];
+      const wirePayload = `${sequenceMessages.map((m) => JSON.stringify(m)).join('\n')}\n`;
+
+      await new Promise<void>((resolve, reject) => {
+        let killed = false;
+        recordProc.on('error', reject);
+        recordProc.on('close', () => resolve());
+
+        attachLineReader(recordProc.stdout, {
+          onLine: (line) => {
+            if (killed) return;
+            let msg: Record<string, unknown> | null = null;
+            try {
+              msg = JSON.parse(line) as Record<string, unknown>;
+            } catch {
+              msg = null;
+            }
+            // Immediately hard-kill `record` the instant `tools/list` (id: 2) response arrives,
+            // without closing stdin and without allowing any async finalize timer to run.
+            if (msg && msg.id === 2) {
+              killed = true;
+              const pid = recordProc.pid;
+              if (typeof pid === 'number' && pid > 0) {
+                if (process.platform === 'win32') {
+                  try {
+                    execFileSync('taskkill.exe', ['/PID', String(pid), '/T', '/F'], {
+                      stdio: 'ignore',
+                      windowsHide: true,
+                    });
+                  } catch {
+                    // ignore if already exited
+                  }
+                } else {
+                  try {
+                    process.kill(-pid, 'SIGKILL');
+                  } catch {
+                    try {
+                      recordProc.kill('SIGKILL');
+                    } catch {
+                      // ignore
+                    }
+                  }
+                }
+              }
+            }
+          },
+        });
+
+        // Write messages while keeping stdin open (exact host behavior)
+        recordProc.stdin.write(wirePayload);
+      });
+
+      // Cassette MUST exist on disk with zero leftover .tmp files
+      assert.equal(fs.existsSync(cassettePath), true, 'Expected cassette file to exist after hard-kill');
+      const leftoverTmp = fs.readdirSync(tmpDir).filter((name) => name.endsWith('.tmp'));
+      assert.deepEqual(leftoverTmp, []);
+
+      const { cassette } = loadCassette(cassettePath);
+      assert.equal(cassette.version, 1);
+      assert.equal(cassette.protocolVersion, '2024-11-05');
+      assert.deepEqual(cassette.serverInfo, {
+        name: 'fixture-mcp-server',
+        version: '1.2.0',
+      });
+      assert.equal(cassette.interactions.length, 3);
+      assert.deepEqual(
+        cassette.interactions.map((item) => item.method),
+        ['initialize', 'notifications/initialized', 'tools/list'],
+      );
+      assert.ok(cassette.interactions[0]?.response?.result !== undefined);
+      assert.ok(cassette.interactions[2]?.response?.result !== undefined);
+
+      // Verify strict offline replay against the hard-kill recorded cassette
+      const replayRes = await runNodeCli(
+        DIST_CLI,
+        ['replay', '--cassette', cassettePath, '--strict'],
+        wirePayload,
+      );
+      assert.equal(replayRes.code, 0);
+      const replayLines = replayRes.stdout
+        .trim()
+        .split('\n')
+        .filter((l) => l.trim().length > 0)
+        .map((l) => JSON.parse(l) as Record<string, unknown>);
+      assert.equal(replayLines.length, 2);
+      assert.equal(replayLines[0]?.id, 1);
+      assert.equal(replayLines[1]?.id, 2);
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }

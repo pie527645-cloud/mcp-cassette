@@ -126,6 +126,31 @@ export async function recordSession(options: RecordOptions): Promise<RecordSessi
     process.once('SIGINT', onSignal);
     process.once('SIGTERM', onSignal);
 
+    const buildRedactedCassette = (): CassetteV1 => {
+      const unredactedCassette: CassetteV1 = {
+        version: 1,
+        recordedAt,
+        serverCommand: commandTokens,
+        protocolVersion,
+        serverInfo,
+        redactionCount: 0,
+        interactions: interactions.map((item, idx) => ({ ...item, index: idx })),
+      };
+
+      return redactCassette(unredactedCassette, {
+        redactEnv: Boolean(options.redactEnv),
+        env: options.env ?? process.env,
+      });
+    };
+
+    const flushCheckpoint = (): CassetteV1 => {
+      const redactedCassette = buildRedactedCassette();
+      if (options.outPath) {
+        saveCassette(options.outPath, redactedCassette);
+      }
+      return redactedCassette;
+    };
+
     const finalize = async (reason: 'eof' | 'child_exit' | 'timeout' | 'signal'): Promise<void> => {
       if (finalizing) return;
       finalizing = true;
@@ -150,32 +175,22 @@ export async function recordSession(options: RecordOptions): Promise<RecordSessi
         // ignore
       }
 
+      // Synchronously persist redacted cassette BEFORE async child-tree reaping so trailing
+      // notifications or unanswered requests are guaranteed on disk even if parent terminates us.
+      let redactedCassette: CassetteV1;
+      let checkpointErr: Error | undefined;
+      try {
+        redactedCassette = flushCheckpoint();
+      } catch (err) {
+        checkpointErr = err instanceof Error ? err : new Error(String(err));
+        redactedCassette = buildRedactedCassette();
+      }
+
       await killProcessTree(child);
 
-      // Filter out any unanswered request slots only if needed? No — keep them without `response`
-      // or with recorded request metadata so timeout diagnostics remain visible in the cassette.
-      const unredactedCassette: CassetteV1 = {
-        version: 1,
-        recordedAt,
-        serverCommand: commandTokens,
-        protocolVersion,
-        serverInfo,
-        redactionCount: 0,
-        interactions: interactions.map((item, idx) => ({ ...item, index: idx })),
-      };
-
-      const redactedCassette = redactCassette(unredactedCassette, {
-        redactEnv: Boolean(options.redactEnv),
-        env: options.env ?? process.env,
-      });
-
-      if (options.outPath) {
-        try {
-          saveCassette(options.outPath, redactedCassette);
-        } catch (err) {
-          reject(err instanceof Error ? err : new Error(String(err)));
-          return;
-        }
+      if (checkpointErr) {
+        reject(checkpointErr);
+        return;
       }
 
       resolve({
@@ -259,7 +274,9 @@ export async function recordSession(options: RecordOptions): Promise<RecordSessi
       }
     };
 
-    const handleServerMessageObject = (msg: Record<string, unknown>): void => {
+    const handleServerMessageObject = (
+      msg: Record<string, unknown>,
+    ): { handled: boolean; shouldSettle: boolean } => {
       if (
         Object.hasOwn(msg, 'id') &&
         msg.id !== undefined &&
@@ -310,11 +327,12 @@ export async function recordSession(options: RecordOptions): Promise<RecordSessi
             }
           }
 
-          if (inputEnded && pendingCount === 0) {
-            scheduleSettleFinalize(25);
-          }
+          return {
+            handled: true,
+            shouldSettle: inputEnded && pendingCount === 0,
+          };
         }
-        return;
+        return { handled: false, shouldSettle: false };
       }
 
       if (typeof msg.method === 'string' && msg.method.length > 0 && !Object.hasOwn(msg, 'id')) {
@@ -328,33 +346,67 @@ export async function recordSession(options: RecordOptions): Promise<RecordSessi
           interaction.params = msg.params as JsonValue;
         }
         interactions.push(interaction);
+        return { handled: true, shouldSettle: false };
       }
+
+      return { handled: false, shouldSettle: false };
     };
 
     if (child.stdout) {
       detachChildStdout = attachLineReader(child.stdout, {
         onLine: (line) => {
+          // 1. Parse JSON and record interaction/latency BEFORE disk checkpoint I/O
+          let parsed: unknown = null;
+          let isJson = false;
+          try {
+            parsed = JSON.parse(line);
+            isJson = true;
+          } catch {
+            isJson = false;
+          }
+
+          let anyHandled = false;
+          let shouldSettle = false;
+
+          if (isJson) {
+            if (Array.isArray(parsed)) {
+              for (const item of parsed) {
+                if (isPlainObject(item)) {
+                  const outcome = handleServerMessageObject(item);
+                  anyHandled = anyHandled || outcome.handled;
+                  shouldSettle = shouldSettle || outcome.shouldSettle;
+                }
+              }
+            } else if (isPlainObject(parsed)) {
+              const outcome = handleServerMessageObject(parsed);
+              anyHandled = outcome.handled;
+              shouldSettle = outcome.shouldSettle;
+            }
+          }
+
+          // 2. Atomically flush redacted checkpoint BEFORE forwarding line to host stdout,
+          //    eliminating any race if the host hard-kills mcp-cassette upon reading the response.
+          if (anyHandled) {
+            try {
+              flushCheckpoint();
+            } catch (err) {
+              if (!finalizing) {
+                void finalize('child_exit').then(() => {}, () => {});
+                reject(err instanceof Error ? err : new Error(String(err)));
+              }
+              return;
+            }
+          }
+
+          // 3. Forward raw line to host stdout
           try {
             outputStream.write(`${line}\n`);
           } catch {
             // ignore broken downstream stdout pipe
           }
 
-          let parsed: unknown;
-          try {
-            parsed = JSON.parse(line);
-          } catch {
-            return;
-          }
-
-          if (Array.isArray(parsed)) {
-            for (const item of parsed) {
-              if (isPlainObject(item)) {
-                handleServerMessageObject(item);
-              }
-            }
-          } else if (isPlainObject(parsed)) {
-            handleServerMessageObject(parsed);
+          if (shouldSettle) {
+            scheduleSettleFinalize(25);
           }
         },
         onError: (err) => {
