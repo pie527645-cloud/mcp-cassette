@@ -1,0 +1,72 @@
+{
+  "name": "@pie527645-cloud/mcp-cassette",
+  "version": "0.1.0",
+  "description": "Deterministic MCP stdio traffic recorder, secret-redacting cassette serializer, and offline CI replay mock server.",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20.18.1"
+  },
+  "bin": {
+    "mcp-cassette": "./dist/cli.js"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./redact": {
+      "types": "./dist/redact.d.ts",
+      "import": "./dist/redact.js"
+    },
+    "./cassette": {
+      "types": "./dist/cassette.d.ts",
+      "import": "./dist/cassette.js"
+    },
+    "./record": {
+      "types": "./dist/record.d.ts",
+      "import": "./dist/record.js"
+    },
+    "./replay": {
+      "types": "./dist/replay.d.ts",
+      "import": "./dist/replay.js"
+    },
+    "./inspect": {
+      "types": "./dist/inspect.d.ts",
+      "import": "./dist/inspect.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "lint": "tsc -p tsconfig.test.json --noEmit",
+    "build": "tsc -p tsconfig.json",
+    "build:test": "tsc -p tsconfig.test.json",
+    "test": "tsc -p tsconfig.json && tsc -p tsconfig.test.json && node --test dist-test/tests/argv.test.js dist-test/tests/canonical.test.js dist-test/tests/redact.test.js dist-test/tests/record-replay.test.js dist-test/tests/inspect.test.js dist-test/tests/cli.test.js"
+  },
+  "devDependencies": {
+    "@types/node": "^20.17.19",
+    "typescript": "^5.7.3"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "cassette",
+    "vcr",
+    "recorder",
+    "replay",
+    "mock-server",
+    "redaction",
+    "deterministic-testing",
+    "ci"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/pie527645-cloud/mcp-cassette.git"
+  }
+}
